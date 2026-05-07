@@ -25,6 +25,19 @@ Servidor Model Context Protocol (MCP) para que agentes IA consulten correos por 
 - `email_move_message`: mueve un mensaje entre carpetas IMAP.
 - `email_save_draft`: guarda un borrador en la carpeta elegida.
 - `email_create_folder`: crea una carpeta IMAP.
+- `email_mark_messages`: marca mensajes como leidos, no leidos, destacados o no destacados.
+- `email_reply`: prepara o envia una respuesta con token de confirmacion.
+- `email_forward`: prepara o envia un reenvio con token de confirmacion.
+- `email_archive_messages`: archiva mensajes por criterios con token de confirmacion.
+- `email_summarize_thread_data`: devuelve datos ordenados de un hilo para que el agente lo resuma.
+- `email_search_threads`: busca mensajes agrupados por conversacion.
+- `email_get_recent_attachments`: encuentra adjuntos recientes por remitente, asunto o extension.
+- `email_extract_structured`: extrae emails, montos, identificaciones, telefonos, links y numeros de factura.
+- `email_apply_rules_preview`: previsualiza reglas de movimiento por criterios.
+- `email_apply_rules`: aplica reglas previsualizadas con token de confirmacion.
+- `email_watch_mailbox`: devuelve mensajes nuevos desde el ultimo UID visto.
+- `email_test_account`: prueba conectividad IMAP/SMTP sin exponer credenciales.
+- `email_find_unsubscribe_links`: detecta enlaces de baja en headers y cuerpo del mensaje.
 
 ## Configuracion
 

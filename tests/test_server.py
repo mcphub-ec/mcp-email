@@ -33,12 +33,19 @@ def load_server(monkeypatch):
 
 def sample_message() -> EmailMessage:
     message = EmailMessage()
+    message["Message-ID"] = "<msg-102@example.com>"
     message["Subject"] = "=?utf-8?q?Factura_=C3=A9xito?="
     message["From"] = "Alice <alice@example.com>"
     message["To"] = "Bob <bob@example.com>"
+    message["Cc"] = "Carol <carol@example.com>"
     message["Date"] = "Wed, 06 May 2026 12:00:00 +0000"
-    message.set_content("Hola mundo")
-    message.add_alternative("<html><body><script>bad()</script><p onclick=\"bad()\">Hola</p></body></html>", subtype="html")
+    message["List-Unsubscribe"] = "<https://example.com/unsubscribe?id=123>"
+    message.set_content("Hola mundo\nFactura F001-002 por $123.45 RUC 0999999999001 https://example.com/pay")
+    message.add_alternative(
+        "<html><body><script>bad()</script><p onclick=\"bad()\">Hola</p>"
+        "<a href=\"https://example.com/unsubscribe\">unsubscribe</a></body></html>",
+        subtype="html",
+    )
     message.add_attachment(b"PDF", maintype="application", subtype="pdf", filename="factura.pdf")
     return message
 
@@ -56,6 +63,7 @@ class FakeIMAP:
         self.created_mailboxes = []
         self.appended = []
         self.expunge_count = 0
+        self.flags = {}
         self.logged_out = False
         self.selected_mailbox = "INBOX"
 
@@ -85,6 +93,10 @@ class FakeIMAP:
                     for uid, raw in self.mailboxes.get(mailbox, {}).items()
                     if needle in raw.decode("utf-8", errors="ignore")
                 ]
+            if "UID" in criteria:
+                start = criteria.index("UID") + 1
+                requested = criteria[start].split(",")
+                uids = [uid for uid in uids if uid in requested]
             return "OK", [" ".join(uids).encode("ascii")]
         if normalized == "fetch":
             uid = str(args[0])
@@ -98,10 +110,20 @@ class FakeIMAP:
             return "OK", [b"copied"]
         if normalized == "store":
             uid = str(args[0])
-            if uid in self.mailboxes.get(self.selected_mailbox, {}):
+            operation = str(args[1])
+            flag = str(args[2])
+            self.flags.setdefault(self.selected_mailbox, {}).setdefault(uid, set())
+            if operation.startswith("+"):
+                self.flags[self.selected_mailbox][uid].add(flag)
+            elif operation.startswith("-"):
+                self.flags[self.selected_mailbox][uid].discard(flag)
+            if "Deleted" in flag and uid in self.mailboxes.get(self.selected_mailbox, {}):
                 del self.mailboxes[self.selected_mailbox][uid]
             return "OK", [b"stored"]
         return "NO", []
+
+    def noop(self):
+        return "OK", [b"noop"]
 
     def create(self, mailbox):
         if mailbox in self.mailboxes:
@@ -145,6 +167,9 @@ class FakeSMTP:
     def quit(self):
         self.closed = True
 
+    def noop(self):
+        return 250, b"OK"
+
 
 def test_load_account_and_list_accounts_never_expose_secrets(monkeypatch):
     server = load_server(monkeypatch)
@@ -167,7 +192,7 @@ def test_parse_mime_message_decodes_headers_sanitizes_html_and_lists_attachments
 
     assert parsed["subject"] == "Factura éxito"
     assert parsed["from"] == ["alice@example.com"]
-    assert parsed["body_text"] == "Hola mundo"
+    assert parsed["body_text"].startswith("Hola mundo")
     assert "<script>" not in parsed["body_html"]
     assert "onclick" not in parsed["body_html"]
     assert parsed["attachments"][0]["filename"] == "factura.pdf"
@@ -277,6 +302,112 @@ def test_move_delete_draft_and_create_folder(monkeypatch):
     assert deleted["deleted_count"] == 1
     assert draft_uid in deleted["deleted_uids"]
     assert fake.expunge_count >= 2
+
+
+def test_mark_reply_forward_archive_rules_and_extract_tools(monkeypatch):
+    server = load_server(monkeypatch)
+    fake = FakeIMAP(sample_message().as_bytes())
+    monkeypatch.setattr(server, "_connect_imap", Mock(return_value=fake))
+    FakeSMTP.sent = []
+    monkeypatch.setattr(server.smtplib, "SMTP", FakeSMTP)
+
+    marked = server.email_mark_messages(account_id="personal", mailbox="INBOX", mark_as="read", limit=10)
+    assert marked["marked_uids"] == ["102"]
+    assert r"(\Seen)" in fake.flags["INBOX"]["102"]
+
+    reply_preview = server.email_reply(
+        account_id="personal",
+        mailbox="INBOX",
+        uid="102",
+        body_text="Gracias",
+        reply_all=True,
+    )
+    assert reply_preview["reply_requires_same_payload"] is True
+    reply_sent = server.email_reply(
+        account_id="personal",
+        mailbox="INBOX",
+        uid="102",
+        body_text="Gracias",
+        reply_all=True,
+        reply_token=reply_preview["reply_token"],
+    )
+    assert reply_sent["success"] is True
+
+    forward_preview = server.email_forward(
+        account_id="personal",
+        mailbox="INBOX",
+        uid="102",
+        to="manager@example.com",
+        body_text="FYI",
+    )
+    forward_sent = server.email_forward(
+        account_id="personal",
+        mailbox="INBOX",
+        uid="102",
+        to="manager@example.com",
+        body_text="FYI",
+        forward_token=forward_preview["forward_token"],
+    )
+    assert forward_sent["success"] is True
+    assert len(FakeSMTP.sent) == 2
+
+    attachments = server.email_get_recent_attachments(
+        account_id="personal",
+        mailbox="INBOX",
+        extension="pdf",
+    )
+    assert attachments["attachments"][0]["filename"] == "factura.pdf"
+
+    structured = server.email_extract_structured(account_id="personal", mailbox="INBOX", uid="102")
+    assert "0999999999001" in structured["ecuador_ids"]
+    assert any("123.45" in amount for amount in structured["amounts"])
+
+    unsubscribe = server.email_find_unsubscribe_links(account_id="personal", mailbox="INBOX", uid="102")
+    assert unsubscribe["list_unsubscribe"] == ["https://example.com/unsubscribe?id=123"]
+
+    watched = server.email_watch_mailbox(account_id="personal", mailbox="INBOX", since_uid="101", limit=10)
+    assert watched["messages"][0]["uid"] == "102"
+
+    thread = server.email_summarize_thread_data(account_id="personal", mailbox="INBOX", uid="102")
+    assert thread["messages"][0]["uid"] == "102"
+
+    threads = server.email_search_threads(account_id="personal", mailbox="INBOX")
+    assert threads["threads"][0]["messages"][0]["uid"] == "102"
+
+    archive_preview = server.email_archive_messages(
+        account_id="personal",
+        source_mailbox="INBOX",
+        destination_mailbox="Archive",
+        limit=10,
+    )
+    archive_result = server.email_archive_messages(
+        account_id="personal",
+        source_mailbox="INBOX",
+        destination_mailbox="Archive",
+        limit=10,
+        archive_token=archive_preview["archive_token"],
+    )
+    assert archive_result["success"] is True
+    assert "102" in fake.mailboxes["Archive"]
+
+
+def test_rules_preview_apply_and_account_test(monkeypatch):
+    server = load_server(monkeypatch)
+    fake = FakeIMAP(sample_message().as_bytes())
+    monkeypatch.setattr(server, "_connect_imap", Mock(return_value=fake))
+    monkeypatch.setattr(server.smtplib, "SMTP", FakeSMTP)
+
+    rules = [{"source_mailbox": "INBOX", "destination_mailbox": "Archive", "subject": "Factura"}]
+    preview = server.email_apply_rules_preview(account_id="personal", rules=rules)
+    assert preview["rules"][0]["matching_uids"] == ["102"]
+
+    applied = server.email_apply_rules(account_id="personal", rules=rules, rules_token=preview["rules_token"])
+    assert applied["success"] is True
+    assert applied["results"][0]["moved_uids"] == ["102"]
+
+    account_test = server.email_test_account("personal")
+    assert account_test["imap"]["ok"] is True
+    assert account_test["smtp"]["ok"] is True
 
 
 def test_missing_master_key_blocks_prepare_email(monkeypatch):

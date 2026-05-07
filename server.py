@@ -391,6 +391,176 @@ def _token_for_payload(canonical_payload: str) -> str:
     return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
 
+def _canonical_action_payload(action: str, payload: dict[str, Any]) -> str:
+    normalized = {"action": action, **payload}
+    return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _action_token(action: str, payload: dict[str, Any]) -> str:
+    return _token_for_payload(_canonical_action_payload(action, payload))
+
+
+def _require_action_token(action: str, payload: dict[str, Any], token: str, token_name: str) -> None:
+    expected_token = _action_token(action, payload)
+    if not token or not hmac.compare_digest(token, expected_token):
+        raise ValueError(f"Invalid {token_name}. Preview the exact same payload before executing.")
+
+
+def _message_metadata(message: Message, uid: str) -> dict[str, Any]:
+    parsed = _extract_message(message, include_body=False)
+    return {
+        "uid": uid,
+        "message_id": parsed["message_id"],
+        "subject": parsed["subject"],
+        "from": parsed["from"],
+        "to": parsed["to"],
+        "cc": parsed["cc"],
+        "date": parsed["date"],
+        "has_attachments": bool(parsed["attachments"]),
+        "attachments": parsed["attachments"],
+    }
+
+
+def _messages_for_uids(client: imaplib.IMAP4_SSL, uids: list[str], *, include_body: bool = False) -> list[dict[str, Any]]:
+    messages = []
+    for uid in uids:
+        message = _fetch_message(client, uid)
+        parsed = _extract_message(message, include_body=include_body)
+        parsed.update({"uid": uid})
+        messages.append(parsed)
+    return messages
+
+
+def _send_message(account: EmailAccount, message: EmailMessage, recipients: list[str]) -> None:
+    client = _connect_smtp(account)
+    try:
+        client.send_message(message, from_addr=account.from_address, to_addrs=recipients)
+    finally:
+        client.quit()
+
+
+def _prefixed_subject(prefix: str, subject: str) -> str:
+    cleaned = subject.strip()
+    if cleaned.lower().startswith(prefix.lower()):
+        return cleaned
+    return f"{prefix} {cleaned}".strip()
+
+
+def _without_own_address(addresses: list[str], account: EmailAccount) -> list[str]:
+    own = {account.from_address.lower(), account.imap_user.lower(), account.smtp_user.lower()}
+    return [address for address in addresses if address.lower() not in own]
+
+
+def _reply_payload(
+    account_id: str,
+    mailbox: str,
+    uid: str,
+    body_text: str,
+    body_html: str,
+    reply_all: bool,
+) -> dict[str, Any]:
+    return {
+        "account_id": account_id,
+        "mailbox": mailbox,
+        "uid": uid,
+        "body_text": body_text or "",
+        "body_html": body_html or "",
+        "reply_all": bool(reply_all),
+    }
+
+
+def _forward_payload(
+    account_id: str,
+    mailbox: str,
+    uid: str,
+    to: list[str],
+    cc: list[str],
+    bcc: list[str],
+    body_text: str,
+    body_html: str,
+) -> dict[str, Any]:
+    return {
+        "account_id": account_id,
+        "mailbox": mailbox,
+        "uid": uid,
+        "to": to,
+        "cc": cc,
+        "bcc": bcc,
+        "body_text": body_text or "",
+        "body_html": body_html or "",
+    }
+
+
+def _archive_payload(
+    account_id: str,
+    source_mailbox: str,
+    destination_mailbox: str,
+    query: Optional[str],
+    since: Optional[str],
+    before: Optional[str],
+    from_: Optional[str],
+    to: Optional[str],
+    subject: Optional[str],
+    limit: Optional[int],
+) -> dict[str, Any]:
+    return {
+        "account_id": account_id,
+        "source_mailbox": source_mailbox,
+        "destination_mailbox": destination_mailbox,
+        "query": query or "",
+        "since": since or "",
+        "before": before or "",
+        "from": from_ or "",
+        "to": to or "",
+        "subject": subject or "",
+        "limit": _safe_limit(limit),
+    }
+
+
+def _first_header(message: Message, *names: str) -> str:
+    for name in names:
+        value = _decode(message.get(name))
+        if value:
+            return value
+    return ""
+
+
+def _thread_keys(message: Message) -> set[str]:
+    keys = set()
+    for header in ("Message-ID", "In-Reply-To", "References"):
+        for value in re.findall(r"<[^>]+>", _decode(message.get(header))):
+            keys.add(value)
+    return keys
+
+
+def _extract_links(text: str) -> list[str]:
+    return re.findall(r"https?://[^\s<>'\")]+", text or "")
+
+
+def _extract_structured_values(text: str) -> dict[str, Any]:
+    email_pattern = r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+    money_pattern = r"(?:USD\s*)?\$?\s?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})"
+    invoice_pattern = r"\b(?:factura|invoice|comprobante|receipt)\s*[:#-]?\s*([A-Za-z0-9-]{3,})"
+    phone_pattern = r"(?:\+?\d[\d\s().-]{7,}\d)"
+    id_pattern = r"\b(?:\d{13}|\d{10})\b"
+    return {
+        "emails": sorted(set(re.findall(email_pattern, text or ""))),
+        "amounts": sorted(set(match.strip() for match in re.findall(money_pattern, text or "", flags=re.IGNORECASE))),
+        "invoice_numbers": sorted(set(re.findall(invoice_pattern, text or "", flags=re.IGNORECASE))),
+        "phones": sorted(set(match.strip() for match in re.findall(phone_pattern, text or ""))),
+        "ecuador_ids": sorted(set(re.findall(id_pattern, text or ""))),
+        "links": sorted(set(_extract_links(text or ""))),
+    }
+
+
+def _rule_payload(account_id: str, rules: list[dict[str, Any]], limit_per_rule: int) -> dict[str, Any]:
+    return {
+        "account_id": account_id,
+        "rules": rules,
+        "limit_per_rule": _safe_limit(limit_per_rule),
+    }
+
+
 def _load_reply_context(client: imaplib.IMAP4_SSL, mailbox: str, uid: str) -> dict[str, str]:
     try:
         message = _fetch_message(client, uid)
@@ -818,6 +988,470 @@ def email_save_draft(
             "mailbox": mailbox,
             "draft_uid": draft_uid,
             "message_id": message["Message-ID"],
+        }
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_mark_messages(
+    account_id: str,
+    mailbox: str = "INBOX",
+    mark_as: str = "read",
+    query: Optional[str] = None,
+    since: Optional[str] = None,
+    before: Optional[str] = None,
+    from_: Optional[str] = None,
+    to: Optional[str] = None,
+    subject: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """Mark messages as read, unread, flagged, or unflagged."""
+    flag_map = {
+        "read": ("+FLAGS.SILENT", r"(\Seen)"),
+        "unread": ("-FLAGS.SILENT", r"(\Seen)"),
+        "flagged": ("+FLAGS.SILENT", r"(\Flagged)"),
+        "unflagged": ("-FLAGS.SILENT", r"(\Flagged)"),
+    }
+    if mark_as not in flag_map:
+        raise ValueError("mark_as must be one of: read, unread, flagged, unflagged")
+
+    account = _load_account(account_id)
+    client = _connect_imap(account)
+    try:
+        criteria = _build_search_criteria(query, since, before, from_, to, subject)
+        uids = _search_uids(client, mailbox, criteria, readonly=False, limit=limit)
+        operation, flag = flag_map[mark_as]
+        for uid in uids:
+            status, data = client.uid("store", uid, operation, flag)
+            if status != "OK":
+                detail = data[0].decode("utf-8", errors="replace") if data else "unknown error"
+                raise RuntimeError(f"Could not mark UID {uid}: {detail}")
+        logger.info("Marked email account=%s mailbox=%s mark_as=%s count=%d", account_id, mailbox, mark_as, len(uids))
+        return {"success": True, "account_id": account_id, "mailbox": mailbox, "mark_as": mark_as, "marked_uids": uids}
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_reply(
+    account_id: str,
+    mailbox: str,
+    uid: str,
+    body_text: str,
+    body_html: str = "",
+    reply_all: bool = False,
+    reply_token: str = "",
+) -> dict[str, Any]:
+    """Preview or send a reply to a message using a confirmation token."""
+    account = _load_account(account_id)
+    payload = _reply_payload(account_id, mailbox, uid, body_text, body_html, reply_all)
+    client = _connect_imap(account)
+    try:
+        _select_mailbox(client, mailbox, readonly=True)
+        original = _fetch_message(client, uid)
+        original_parsed = _extract_message(original, include_body=False)
+        to = _message_addresses(original.get("Reply-To")) or original_parsed["from"]
+        cc: list[str] = []
+        if reply_all:
+            to = _without_own_address(list(dict.fromkeys(to + original_parsed["to"])), account)
+            cc = _without_own_address(original_parsed["cc"], account)
+        to = _without_own_address(to, account)
+        subject = _prefixed_subject("Re:", original_parsed["subject"])
+
+        if not reply_token:
+            return {
+                "account_id": account_id,
+                "mailbox": mailbox,
+                "uid": uid,
+                "to": to,
+                "cc": cc,
+                "subject": subject,
+                "body_text_preview": (body_text or "")[:1000],
+                "body_html_preview": _sanitize_html(body_html or "")[:1000],
+                "reply_token": _action_token("reply", payload),
+                "reply_requires_same_payload": True,
+            }
+
+        _require_action_token("reply", payload, reply_token, "reply_token")
+        message = _build_outbound_message(account, to, cc, [], subject, body_text, body_html)
+        _apply_reply_headers(message, _load_reply_context(client, mailbox, uid))
+        _send_message(account, message, to + cc)
+        logger.info("Sent reply account=%s mailbox=%s uid=%s recipients=%d", account_id, mailbox, uid, len(to + cc))
+        return {"success": True, "account_id": account_id, "mailbox": mailbox, "uid": uid, "recipients": to + cc}
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_forward(
+    account_id: str,
+    mailbox: str,
+    uid: str,
+    to: list[str] | str,
+    cc: Optional[list[str] | str] = None,
+    bcc: Optional[list[str] | str] = None,
+    body_text: str = "",
+    body_html: str = "",
+    forward_token: str = "",
+) -> dict[str, Any]:
+    """Preview or send a forwarded message using a confirmation token."""
+    account = _load_account(account_id)
+    recipients_to = _as_list(to)
+    recipients_cc = _as_list(cc)
+    recipients_bcc = _as_list(bcc)
+    if not recipients_to and not recipients_cc and not recipients_bcc:
+        raise ValueError("At least one recipient is required.")
+    payload = _forward_payload(account_id, mailbox, uid, recipients_to, recipients_cc, recipients_bcc, body_text, body_html)
+
+    client = _connect_imap(account)
+    try:
+        _select_mailbox(client, mailbox, readonly=True)
+        original = _fetch_message(client, uid)
+        original_parsed = _extract_message(original, include_body=True)
+        subject = _prefixed_subject("Fwd:", original_parsed["subject"])
+        forwarded_text = (
+            f"{body_text}\n\n"
+            f"---------- Forwarded message ----------\n"
+            f"From: {', '.join(original_parsed['from'])}\n"
+            f"Date: {original_parsed['date'] or ''}\n"
+            f"Subject: {original_parsed['subject']}\n"
+            f"To: {', '.join(original_parsed['to'])}\n\n"
+            f"{original_parsed['body_text']}"
+        ).strip()
+
+        if not forward_token:
+            return {
+                "account_id": account_id,
+                "mailbox": mailbox,
+                "uid": uid,
+                "to": recipients_to,
+                "cc": recipients_cc,
+                "bcc": recipients_bcc,
+                "subject": subject,
+                "body_text_preview": forwarded_text[:1000],
+                "forward_token": _action_token("forward", payload),
+                "forward_requires_same_payload": True,
+            }
+
+        _require_action_token("forward", payload, forward_token, "forward_token")
+        message = _build_outbound_message(
+            account,
+            recipients_to,
+            recipients_cc,
+            recipients_bcc,
+            subject,
+            forwarded_text,
+            body_html,
+        )
+        recipients = recipients_to + recipients_cc + recipients_bcc
+        _send_message(account, message, recipients)
+        logger.info("Forwarded email account=%s mailbox=%s uid=%s recipients=%d", account_id, mailbox, uid, len(recipients))
+        return {"success": True, "account_id": account_id, "mailbox": mailbox, "uid": uid, "recipients": recipients}
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_archive_messages(
+    account_id: str,
+    source_mailbox: str = "INBOX",
+    destination_mailbox: str = "Archive",
+    archive_token: str = "",
+    query: Optional[str] = None,
+    since: Optional[str] = None,
+    before: Optional[str] = None,
+    from_: Optional[str] = None,
+    to: Optional[str] = None,
+    subject: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """Preview or archive messages by criteria using a confirmation token."""
+    account = _load_account(account_id)
+    safe_limit = _safe_limit(limit)
+    payload = _archive_payload(account_id, source_mailbox, destination_mailbox, query, since, before, from_, to, subject, safe_limit)
+    client = _connect_imap(account)
+    try:
+        criteria = _build_search_criteria(query, since, before, from_, to, subject)
+        uids = _search_uids(client, source_mailbox, criteria, readonly=not bool(archive_token), limit=safe_limit)
+        if not archive_token:
+            return {
+                "account_id": account_id,
+                "source_mailbox": source_mailbox,
+                "destination_mailbox": destination_mailbox,
+                "match_count": len(uids),
+                "matching_uids": uids,
+                "archive_token": _action_token("archive", payload),
+                "archive_requires_same_payload": True,
+            }
+
+        _require_action_token("archive", payload, archive_token, "archive_token")
+        archived = []
+        for message_uid in uids:
+            copy_status, copy_data = client.uid("copy", message_uid, destination_mailbox)
+            if copy_status != "OK":
+                detail = copy_data[0].decode("utf-8", errors="replace") if copy_data else "unknown error"
+                raise RuntimeError(f"Could not copy UID {message_uid}: {detail}")
+            store_status, store_data = client.uid("store", message_uid, "+FLAGS.SILENT", r"(\Deleted)")
+            if store_status != "OK":
+                detail = store_data[0].decode("utf-8", errors="replace") if store_data else "unknown error"
+                raise RuntimeError(f"Could not mark UID {message_uid} as deleted: {detail}")
+            archived.append(message_uid)
+        if archived:
+            client.expunge()
+        return {"success": True, "account_id": account_id, "archived_count": len(archived), "archived_uids": archived}
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_summarize_thread_data(account_id: str, mailbox: str, uid: str, limit: int = 20) -> dict[str, Any]:
+    """Return ordered thread data for the agent to summarize."""
+    account = _load_account(account_id)
+    client = _connect_imap(account)
+    try:
+        _select_mailbox(client, mailbox, readonly=True)
+        root = _fetch_message(client, uid)
+        root_keys = _thread_keys(root)
+        candidate_uids = _search_uids(client, mailbox, ["ALL"], readonly=True, limit=limit)
+        messages = []
+        for candidate_uid in candidate_uids:
+            message = _fetch_message(client, candidate_uid)
+            if candidate_uid == uid or root_keys.intersection(_thread_keys(message)):
+                parsed = _extract_message(message, include_body=True)
+                parsed.update({"uid": candidate_uid})
+                messages.append(parsed)
+        messages.sort(key=lambda item: item.get("date") or "")
+        return {"account_id": account_id, "mailbox": mailbox, "root_uid": uid, "messages": messages}
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_search_threads(
+    account_id: str,
+    mailbox: str = "INBOX",
+    query: Optional[str] = None,
+    since: Optional[str] = None,
+    before: Optional[str] = None,
+    from_: Optional[str] = None,
+    to: Optional[str] = None,
+    subject: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """Search messages and group results by conversation headers."""
+    account = _load_account(account_id)
+    client = _connect_imap(account)
+    try:
+        criteria = _build_search_criteria(query, since, before, from_, to, subject)
+        uids = _search_uids(client, mailbox, criteria, readonly=True, limit=limit)
+        threads: dict[str, dict[str, Any]] = {}
+        for uid in uids:
+            message = _fetch_message(client, uid)
+            keys = sorted(_thread_keys(message))
+            thread_id = keys[0] if keys else _decode(message.get("Message-ID")) or uid
+            threads.setdefault(thread_id, {"thread_id": thread_id, "messages": []})
+            threads[thread_id]["messages"].append(_message_metadata(message, uid))
+        return {"account_id": account_id, "mailbox": mailbox, "threads": list(threads.values())}
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_get_recent_attachments(
+    account_id: str,
+    mailbox: str = "INBOX",
+    from_: Optional[str] = None,
+    subject: Optional[str] = None,
+    extension: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """Find recent attachment metadata by sender, subject, or file extension."""
+    account = _load_account(account_id)
+    client = _connect_imap(account)
+    try:
+        criteria = _build_search_criteria(None, None, None, from_, None, subject)
+        uids = _search_uids(client, mailbox, criteria, readonly=True, limit=limit)
+        wanted_ext = extension.lower().lstrip(".") if extension else ""
+        attachments = []
+        for uid in reversed(uids):
+            message = _fetch_message(client, uid)
+            metadata = _message_metadata(message, uid)
+            for attachment in metadata["attachments"]:
+                filename = attachment["filename"]
+                if wanted_ext and not filename.lower().endswith(f".{wanted_ext}"):
+                    continue
+                attachments.append({"uid": uid, "subject": metadata["subject"], "from": metadata["from"], **attachment})
+        return {"account_id": account_id, "mailbox": mailbox, "attachments": attachments}
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_extract_structured(account_id: str, mailbox: str, uid: str) -> dict[str, Any]:
+    """Extract common structured values from a message without returning full raw email."""
+    account = _load_account(account_id)
+    client = _connect_imap(account)
+    try:
+        _select_mailbox(client, mailbox, readonly=True)
+        message = _fetch_message(client, uid)
+        parsed = _extract_message(message, include_body=True)
+        combined_text = "\n".join([parsed["subject"], parsed["body_text"], re.sub(r"<[^>]+>", " ", parsed["body_html"])])
+        structured = _extract_structured_values(combined_text)
+        return {"account_id": account_id, "mailbox": mailbox, "uid": uid, **structured}
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_apply_rules_preview(account_id: str, rules: list[dict[str, Any]], limit_per_rule: int = 20) -> dict[str, Any]:
+    """Preview rule matches before applying mailbox moves."""
+    account = _load_account(account_id)
+    safe_limit = _safe_limit(limit_per_rule)
+    client = _connect_imap(account)
+    try:
+        previews = []
+        for index, rule in enumerate(rules):
+            source_mailbox = rule.get("source_mailbox", "INBOX")
+            criteria = _build_search_criteria(
+                rule.get("query"),
+                rule.get("since"),
+                rule.get("before"),
+                rule.get("from"),
+                rule.get("to"),
+                rule.get("subject"),
+            )
+            uids = _search_uids(client, source_mailbox, criteria, readonly=True, limit=safe_limit)
+            previews.append(
+                {
+                    "rule_index": index,
+                    "source_mailbox": source_mailbox,
+                    "destination_mailbox": rule.get("destination_mailbox", "Archive"),
+                    "match_count": len(uids),
+                    "matching_uids": uids,
+                }
+            )
+        payload = _rule_payload(account_id, rules, safe_limit)
+        return {
+            "account_id": account_id,
+            "rules": previews,
+            "rules_token": _action_token("apply_rules", payload),
+            "rules_require_same_payload": True,
+        }
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_apply_rules(account_id: str, rules: list[dict[str, Any]], rules_token: str, limit_per_rule: int = 20) -> dict[str, Any]:
+    """Apply previewed move rules using a confirmation token."""
+    account = _load_account(account_id)
+    safe_limit = _safe_limit(limit_per_rule)
+    payload = _rule_payload(account_id, rules, safe_limit)
+    _require_action_token("apply_rules", payload, rules_token, "rules_token")
+    client = _connect_imap(account)
+    try:
+        results = []
+        for index, rule in enumerate(rules):
+            source_mailbox = rule.get("source_mailbox", "INBOX")
+            destination_mailbox = rule.get("destination_mailbox", "Archive")
+            criteria = _build_search_criteria(
+                rule.get("query"),
+                rule.get("since"),
+                rule.get("before"),
+                rule.get("from"),
+                rule.get("to"),
+                rule.get("subject"),
+            )
+            uids = _search_uids(client, source_mailbox, criteria, readonly=False, limit=safe_limit)
+            moved = []
+            for uid in uids:
+                copy_status, copy_data = client.uid("copy", uid, destination_mailbox)
+                if copy_status != "OK":
+                    detail = copy_data[0].decode("utf-8", errors="replace") if copy_data else "unknown error"
+                    raise RuntimeError(f"Could not copy UID {uid}: {detail}")
+                store_status, store_data = client.uid("store", uid, "+FLAGS.SILENT", r"(\Deleted)")
+                if store_status != "OK":
+                    detail = store_data[0].decode("utf-8", errors="replace") if store_data else "unknown error"
+                    raise RuntimeError(f"Could not mark UID {uid} as deleted: {detail}")
+                moved.append(uid)
+            if moved:
+                client.expunge()
+            results.append({"rule_index": index, "moved_count": len(moved), "moved_uids": moved})
+        return {"success": True, "account_id": account_id, "results": results}
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_watch_mailbox(account_id: str, mailbox: str = "INBOX", since_uid: Optional[str] = None, limit: Optional[int] = None) -> dict[str, Any]:
+    """Return messages newer than the last seen UID for polling workflows."""
+    account = _load_account(account_id)
+    client = _connect_imap(account)
+    try:
+        uids = _search_uids(client, mailbox, ["ALL"], readonly=True, limit=limit)
+        if since_uid is not None:
+            uids = [uid for uid in uids if int(uid) > int(since_uid)]
+        messages = [_message_metadata(_fetch_message(client, uid), uid) for uid in uids]
+        last_seen_uid = max([int(uid) for uid in uids], default=int(since_uid or 0))
+        return {"account_id": account_id, "mailbox": mailbox, "last_seen_uid": str(last_seen_uid), "messages": messages}
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_test_account(account_id: str) -> dict[str, Any]:
+    """Test IMAP and SMTP connectivity without exposing credentials."""
+    account = _load_account(account_id)
+    result: dict[str, Any] = {"account_id": account_id, "imap": {"ok": False}, "smtp": {"ok": False}}
+    imap_client = None
+    try:
+        imap_client = _connect_imap(account)
+        status, _ = imap_client.noop()
+        result["imap"] = {"ok": status == "OK", "host": account.imap_host, "port": account.imap_port}
+    except Exception as exc:
+        result["imap"] = {"ok": False, "host": account.imap_host, "port": account.imap_port, "error": str(exc)}
+    finally:
+        if imap_client:
+            imap_client.logout()
+
+    if account.can_send:
+        smtp_client = None
+        try:
+            smtp_client = _connect_smtp(account)
+            status = smtp_client.noop()[0]
+            result["smtp"] = {"ok": 200 <= int(status) < 400, "host": account.smtp_host, "port": account.smtp_port}
+        except Exception as exc:
+            result["smtp"] = {"ok": False, "host": account.smtp_host, "port": account.smtp_port, "error": str(exc)}
+        finally:
+            if smtp_client:
+                smtp_client.quit()
+    else:
+        result["smtp"] = {"ok": False, "configured": False}
+    return result
+
+
+@mcp.tool()
+def email_find_unsubscribe_links(account_id: str, mailbox: str, uid: str) -> dict[str, Any]:
+    """Find List-Unsubscribe headers and unsubscribe links in a message."""
+    account = _load_account(account_id)
+    client = _connect_imap(account)
+    try:
+        _select_mailbox(client, mailbox, readonly=True)
+        message = _fetch_message(client, uid)
+        parsed = _extract_message(message, include_body=True)
+        header_value = _decode(message.get("List-Unsubscribe"))
+        header_links = re.findall(r"<([^>]+)>", header_value)
+        body_links = [
+            link for link in _extract_links(f"{parsed['body_text']}\n{parsed['body_html']}")
+            if "unsubscribe" in link.lower() or "optout" in link.lower()
+        ]
+        return {
+            "account_id": account_id,
+            "mailbox": mailbox,
+            "uid": uid,
+            "list_unsubscribe": header_links,
+            "body_unsubscribe_links": sorted(set(body_links)),
         }
     finally:
         client.logout()
