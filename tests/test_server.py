@@ -45,10 +45,19 @@ def sample_message() -> EmailMessage:
 
 class FakeIMAP:
     def __init__(self, message_bytes: bytes):
+        self.mailboxes = {
+            "INBOX": {"102": message_bytes},
+            "Archive": {},
+            "Drafts": {},
+        }
         self.message_bytes = message_bytes
         self.selected = []
         self.uid_calls = []
+        self.created_mailboxes = []
+        self.appended = []
+        self.expunge_count = 0
         self.logged_out = False
+        self.selected_mailbox = "INBOX"
 
     def login(self, user, password):
         self.user = user
@@ -56,18 +65,61 @@ class FakeIMAP:
 
     def select(self, mailbox, readonly=True):
         self.selected.append((mailbox, readonly))
+        self.selected_mailbox = mailbox
         return "OK", [b"1"]
 
     def list(self):
         return "OK", [b'(\\HasNoChildren) "/" "INBOX"', b'(\\HasNoChildren) "/" "Archive"']
 
     def uid(self, command, *args):
-        self.uid_calls.append((command, args))
-        if command == "search":
-            return "OK", [b"101 102"]
-        if command == "fetch":
-            return "OK", [(b"102 (RFC822 {1}", self.message_bytes)]
+        normalized = command.lower()
+        self.uid_calls.append((normalized, args))
+        if normalized == "search":
+            mailbox = self.selected_mailbox
+            criteria = [item.decode("utf-8") if isinstance(item, bytes) else str(item) for item in args]
+            uids = sorted(self.mailboxes.get(mailbox, {}).keys())
+            if criteria[:2] == ["HEADER", "Message-ID"] and len(criteria) >= 3:
+                needle = criteria[2]
+                uids = [
+                    uid
+                    for uid, raw in self.mailboxes.get(mailbox, {}).items()
+                    if needle in raw.decode("utf-8", errors="ignore")
+                ]
+            return "OK", [" ".join(uids).encode("ascii")]
+        if normalized == "fetch":
+            uid = str(args[0])
+            raw = self.mailboxes.get(self.selected_mailbox, {}).get(uid, self.message_bytes)
+            return "OK", [(f"{uid} (RFC822 {{1}}".encode("ascii"), raw)]
+        if normalized == "copy":
+            uid = str(args[0])
+            dest = str(args[1])
+            raw = self.mailboxes.get(self.selected_mailbox, {}).get(uid, self.message_bytes)
+            self.mailboxes.setdefault(dest, {})[uid] = raw
+            return "OK", [b"copied"]
+        if normalized == "store":
+            uid = str(args[0])
+            if uid in self.mailboxes.get(self.selected_mailbox, {}):
+                del self.mailboxes[self.selected_mailbox][uid]
+            return "OK", [b"stored"]
         return "NO", []
+
+    def create(self, mailbox):
+        if mailbox in self.mailboxes:
+            return "NO", [b"already exists"]
+        self.mailboxes[mailbox] = {}
+        self.created_mailboxes.append(mailbox)
+        return "OK", [b"created"]
+
+    def append(self, mailbox, flags, date_time, message):
+        self.mailboxes.setdefault(mailbox, {})
+        next_uid = str(max([int(uid) for uid in self.mailboxes[mailbox].keys()] + [0]) + 1)
+        self.mailboxes[mailbox][next_uid] = message
+        self.appended.append((mailbox, flags, date_time, message))
+        return "OK", [b"appended"]
+
+    def expunge(self):
+        self.expunge_count += 1
+        return "OK", [b"expunged"]
 
     def logout(self):
         self.logged_out = True
@@ -171,6 +223,60 @@ def test_imap_search_and_attachment_fetch_use_readonly_and_size_limit(monkeypatc
     assert ("fetch", ("102", "(BODY.PEEK[])")) in fake.uid_calls
     assert attachment["filename"] == "factura.pdf"
     assert base64.b64decode(attachment["content_base64"]) == b"PDF"
+
+
+def test_move_delete_draft_and_create_folder(monkeypatch):
+    server = load_server(monkeypatch)
+    fake = FakeIMAP(sample_message().as_bytes())
+    monkeypatch.setattr(server, "_connect_imap", Mock(return_value=fake))
+
+    moved = server.email_move_message(
+        account_id="personal",
+        source_mailbox="INBOX",
+        uid="102",
+        destination_mailbox="Clientes/Archivo",
+    )
+    assert moved["success"] is True
+    assert "102" not in fake.mailboxes["INBOX"]
+    assert "102" in fake.mailboxes["Clientes/Archivo"]
+    assert fake.expunge_count == 1
+
+    draft = server.email_save_draft(
+        account_id="personal",
+        to=["draft@example.com"],
+        subject="Borrador",
+        body_text="Contenido",
+        mailbox="Drafts",
+    )
+    assert draft["success"] is True
+    assert draft["mailbox"] == "Drafts"
+    assert draft["draft_uid"] is not None
+    draft_uid = draft["draft_uid"]
+
+    created = server.email_create_folder(account_id="personal", mailbox="Clientes/Nuevos")
+    assert created["success"] is True
+    assert "Clientes/Nuevos" in fake.created_mailboxes
+
+    prepared_delete = server.prepare_delete_messages(
+        account_id="personal",
+        mailbox="Drafts",
+        subject="Borrador",
+        limit=20,
+    )
+    assert prepared_delete["delete_requires_same_payload"] is True
+    assert draft_uid in prepared_delete["matching_uids"]
+
+    deleted = server.email_delete_messages(
+        account_id="personal",
+        mailbox="Drafts",
+        subject="Borrador",
+        limit=20,
+        delete_token=prepared_delete["delete_token"],
+    )
+    assert deleted["success"] is True
+    assert deleted["deleted_count"] == 1
+    assert draft_uid in deleted["deleted_uids"]
+    assert fake.expunge_count >= 2
 
 
 def test_missing_master_key_blocks_prepare_email(monkeypatch):

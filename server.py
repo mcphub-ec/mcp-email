@@ -105,7 +105,7 @@ def _load_account(account_id: str) -> EmailAccount:
         smtp_port=int(value("SMTP_PORT", "587")),
         smtp_user=value("SMTP_USER"),
         smtp_password=value("SMTP_PASSWORD"),
-        from_address=value("FROM", value("SMTP_USER")),
+        from_address=value("FROM", value("SMTP_USER", value("IMAP_USER"))),
         tls_mode=value("TLS_MODE", "starttls").lower(),
     )
     if not account.can_read:
@@ -305,8 +305,7 @@ def _canonical_payload(
 
 
 def _send_token(canonical_payload: str) -> str:
-    digest = hmac.new(_master_key(), canonical_payload.encode("utf-8"), hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return _token_for_payload(canonical_payload)
 
 
 def _as_list(value: Optional[list[str] | str]) -> list[str]:
@@ -342,6 +341,73 @@ def _build_outbound_message(
     if bcc:
         message["Bcc"] = ", ".join(bcc)
     return message
+
+
+def _search_uids(
+    client: imaplib.IMAP4_SSL,
+    mailbox: str,
+    criteria: list[str],
+    *,
+    readonly: bool = True,
+    limit: Optional[int] = None,
+) -> list[str]:
+    _select_mailbox(client, mailbox, readonly=readonly)
+    status, data = client.uid("search", None, *criteria)
+    if status != "OK":
+        raise RuntimeError("IMAP SEARCH failed.")
+    safe_limit = _safe_limit(limit)
+    uids = (data[0].split() if data and data[0] else [])[-safe_limit:]
+    return [uid.decode("ascii") for uid in uids]
+
+
+def _canonical_delete_payload(
+    account_id: str,
+    mailbox: str,
+    query: Optional[str],
+    since: Optional[str],
+    before: Optional[str],
+    from_: Optional[str],
+    to: Optional[str],
+    subject: Optional[str],
+    limit: Optional[int],
+) -> str:
+    payload = {
+        "action": "delete_messages",
+        "account_id": account_id,
+        "mailbox": mailbox,
+        "query": query or "",
+        "since": since or "",
+        "before": before or "",
+        "from": from_ or "",
+        "to": to or "",
+        "subject": subject or "",
+        "limit": _safe_limit(limit),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _token_for_payload(canonical_payload: str) -> str:
+    digest = hmac.new(_master_key(), canonical_payload.encode("utf-8"), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _load_reply_context(client: imaplib.IMAP4_SSL, mailbox: str, uid: str) -> dict[str, str]:
+    try:
+        message = _fetch_message(client, uid)
+    except Exception:
+        return {}
+    return {
+        "in_reply_to": _decode(message.get("Message-ID")),
+        "references": _decode(message.get("References")),
+    }
+
+
+def _apply_reply_headers(message: EmailMessage, reply_context: dict[str, str]) -> None:
+    in_reply_to = reply_context.get("in_reply_to", "")
+    if in_reply_to:
+        message["In-Reply-To"] = in_reply_to
+        references = reply_context.get("references", "")
+        message["References"] = f"{references} {in_reply_to}".strip() if references else in_reply_to
 
 
 @mcp.tool()
@@ -398,18 +464,14 @@ def search_emails(
 ) -> dict[str, Any]:
     """Search IMAP messages and return recent metadata without message bodies."""
     account = _load_account(account_id)
-    safe_limit = _safe_limit(limit)
     client = _connect_imap(account)
     try:
-        _select_mailbox(client, mailbox, readonly=True)
         criteria = _build_search_criteria(query, since, before, from_, to, subject)
-        status, data = client.uid("search", None, *criteria)
-        if status != "OK":
-            raise RuntimeError("IMAP SEARCH failed.")
-        uids = (data[0].split() if data and data[0] else [])[-safe_limit:]
+        safe_limit = _safe_limit(limit)
+        uids = _search_uids(client, mailbox, criteria, readonly=True, limit=safe_limit)
         results = []
         for raw_uid in reversed(uids):
-            uid = raw_uid.decode("ascii")
+            uid = raw_uid
             message = _fetch_message(client, uid)
             metadata = _extract_message(message, include_body=False)
             results.append(
@@ -569,6 +631,196 @@ def send_prepared_email(
         return {"success": True, "account_id": account_id, "from": account.from_address, "recipients": recipients}
     finally:
         client.quit()
+
+
+@mcp.tool()
+def prepare_delete_messages(
+    account_id: str,
+    mailbox: str = "INBOX",
+    query: Optional[str] = None,
+    since: Optional[str] = None,
+    before: Optional[str] = None,
+    from_: Optional[str] = None,
+    to: Optional[str] = None,
+    subject: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """Prepare a delete operation and return a confirmation token."""
+    account = _load_account(account_id)
+    client = _connect_imap(account)
+    try:
+        criteria = _build_search_criteria(query, since, before, from_, to, subject)
+        safe_limit = _safe_limit(limit)
+        uids = _search_uids(client, mailbox, criteria, readonly=True, limit=safe_limit)
+        canonical = _canonical_delete_payload(account_id, mailbox, query, since, before, from_, to, subject, safe_limit)
+        token = _token_for_payload(canonical)
+        return {
+            "account_id": account_id,
+            "mailbox": mailbox,
+            "match_count": len(uids),
+            "matching_uids": uids,
+            "delete_token": token,
+            "delete_requires_same_payload": True,
+        }
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_delete_messages(
+    account_id: str,
+    mailbox: str = "INBOX",
+    delete_token: str = "",
+    query: Optional[str] = None,
+    since: Optional[str] = None,
+    before: Optional[str] = None,
+    from_: Optional[str] = None,
+    to: Optional[str] = None,
+    subject: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """Delete messages matching the same criteria used to prepare the delete token."""
+    account = _load_account(account_id)
+    client = _connect_imap(account)
+    try:
+        safe_limit = _safe_limit(limit)
+        canonical = _canonical_delete_payload(account_id, mailbox, query, since, before, from_, to, subject, safe_limit)
+        expected_token = _token_for_payload(canonical)
+        if not delete_token or not hmac.compare_digest(delete_token, expected_token):
+            raise ValueError("Invalid delete_token. Call prepare_delete_messages with the exact same criteria before deleting.")
+
+        criteria = _build_search_criteria(query, since, before, from_, to, subject)
+        uids = _search_uids(client, mailbox, criteria, readonly=False, limit=safe_limit)
+        deleted: list[str] = []
+        for uid in uids:
+            status, data = client.uid("store", uid, "+FLAGS.SILENT", r"(\Deleted)")
+            if status != "OK":
+                detail = data[0].decode("utf-8", errors="replace") if data else "unknown error"
+                raise RuntimeError(f"Could not mark UID {uid} as deleted: {detail}")
+            deleted.append(uid)
+        if deleted:
+            expunge_status, expunge_data = client.expunge()
+            if expunge_status != "OK":
+                detail = expunge_data[0].decode("utf-8", errors="replace") if expunge_data else "unknown error"
+                raise RuntimeError(f"Could not expunge mailbox '{mailbox}': {detail}")
+        logger.info("Deleted email account=%s mailbox=%s count=%d", account_id, mailbox, len(deleted))
+        return {
+            "success": True,
+            "account_id": account_id,
+            "mailbox": mailbox,
+            "deleted_count": len(deleted),
+            "deleted_uids": deleted,
+        }
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_move_message(
+    account_id: str,
+    source_mailbox: str,
+    uid: str,
+    destination_mailbox: str,
+) -> dict[str, Any]:
+    """Move a single message from one mailbox to another."""
+    account = _load_account(account_id)
+    client = _connect_imap(account)
+    try:
+        _select_mailbox(client, source_mailbox, readonly=False)
+        copy_status, copy_data = client.uid("copy", uid, destination_mailbox)
+        if copy_status != "OK":
+            detail = copy_data[0].decode("utf-8", errors="replace") if copy_data else "unknown error"
+            raise RuntimeError(f"Could not copy UID {uid} to '{destination_mailbox}': {detail}")
+        store_status, store_data = client.uid("store", uid, "+FLAGS.SILENT", r"(\Deleted)")
+        if store_status != "OK":
+            detail = store_data[0].decode("utf-8", errors="replace") if store_data else "unknown error"
+            raise RuntimeError(f"Could not mark UID {uid} as deleted after copy: {detail}")
+        client.expunge()
+        logger.info(
+            "Moved email account=%s source=%s destination=%s uid=%s",
+            account_id,
+            source_mailbox,
+            destination_mailbox,
+            uid,
+        )
+        return {
+            "success": True,
+            "account_id": account_id,
+            "source_mailbox": source_mailbox,
+            "destination_mailbox": destination_mailbox,
+            "uid": uid,
+        }
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_create_folder(account_id: str, mailbox: str) -> dict[str, Any]:
+    """Create an IMAP folder/mailbox if it does not already exist."""
+    account = _load_account(account_id)
+    client = _connect_imap(account)
+    try:
+        status, data = client.create(mailbox)
+        if status != "OK":
+            detail = data[0].decode("utf-8", errors="replace") if data else "unknown error"
+            raise RuntimeError(f"Could not create mailbox '{mailbox}': {detail}")
+        logger.info("Created mailbox account=%s mailbox=%s", account_id, mailbox)
+        return {"success": True, "account_id": account_id, "mailbox": mailbox}
+    finally:
+        client.logout()
+
+
+@mcp.tool()
+def email_save_draft(
+    account_id: str,
+    to: Optional[list[str] | str] = None,
+    cc: Optional[list[str] | str] = None,
+    bcc: Optional[list[str] | str] = None,
+    subject: str = "",
+    body_text: str = "",
+    body_html: str = "",
+    mailbox: str = "Drafts",
+) -> dict[str, Any]:
+    """Save a message as draft in the target IMAP mailbox."""
+    account = _load_account(account_id)
+    recipients_to = _as_list(to)
+    recipients_cc = _as_list(cc)
+    recipients_bcc = _as_list(bcc)
+
+    message = _build_outbound_message(
+        account,
+        recipients_to,
+        recipients_cc,
+        recipients_bcc,
+        subject,
+        body_text,
+        body_html,
+    )
+    client = _connect_imap(account)
+    try:
+        append_status, append_data = client.append(mailbox, r"(\Draft)", None, message.as_bytes())
+        if append_status != "OK":
+            detail = append_data[0].decode("utf-8", errors="replace") if append_data else "unknown error"
+            raise RuntimeError(f"Could not save draft in '{mailbox}': {detail}")
+
+        draft_uid = None
+        try:
+            criteria = ["HEADER", "Message-ID", message["Message-ID"]]
+            uids = _search_uids(client, mailbox, criteria, readonly=True, limit=1)
+            draft_uid = uids[-1] if uids else None
+        except Exception:
+            draft_uid = None
+
+        logger.info("Saved draft account=%s mailbox=%s", account_id, mailbox)
+        return {
+            "success": True,
+            "account_id": account_id,
+            "mailbox": mailbox,
+            "draft_uid": draft_uid,
+            "message_id": message["Message-ID"],
+        }
+    finally:
+        client.logout()
 
 
 if __name__ == "__main__":

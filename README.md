@@ -7,6 +7,7 @@ Servidor Model Context Protocol (MCP) para que agentes IA consulten correos por 
 - Multiples cuentas nombradas mediante variables de entorno.
 - Lectura IMAP: listar carpetas, buscar correos, leer mensajes y descargar adjuntos bajo limite.
 - Envio SMTP en dos pasos: `prepare_email` genera un `send_token`; `send_prepared_email` envia solo si recibe el mismo contenido y token valido.
+- Operaciones IMAP adicionales: mover mensajes, eliminar por criterios con token, guardar borradores y crear carpetas.
 - Credenciales nunca se aceptan como parametros de herramientas MCP.
 - Logs JSON sin passwords, tokens, cuerpos completos ni adjuntos.
 
@@ -19,6 +20,11 @@ Servidor Model Context Protocol (MCP) para que agentes IA consulten correos por 
 - `get_attachment`: devuelve un adjunto en Base64 si no supera `MAX_ATTACHMENT_BYTES`.
 - `prepare_email`: prepara un mensaje y devuelve `send_token`; no envia.
 - `send_prepared_email`: envia por SMTP si el payload coincide exactamente con el token.
+- `prepare_delete_messages`: prepara un borrado seguro y devuelve `delete_token`.
+- `email_delete_messages`: elimina mensajes por criterios solo si el token coincide con el payload exacto.
+- `email_move_message`: mueve un mensaje entre carpetas IMAP.
+- `email_save_draft`: guarda un borrador en la carpeta elegida.
+- `email_create_folder`: crea una carpeta IMAP.
 
 ## Configuracion
 
@@ -77,4 +83,3 @@ docker run --rm -i --env-file .env mcp-email
 - Usa contrasenas de aplicacion cuando el proveedor lo permita.
 - Restringe el `.env` con `chmod 600 .env`.
 - El agente puede ver contenido de correo y adjuntos solicitados, pero nunca credenciales IMAP/SMTP.
-# mcp-email
