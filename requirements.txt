@@ -1,4 +1,4 @@
-fastmcp
-mcp
-python-dotenv
-uvicorn
+fastmcp==3.3.1
+mcp==1.27.1
+python-dotenv==1.2.2
+uvicorn==0.48.0
