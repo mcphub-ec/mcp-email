@@ -24,7 +24,14 @@ from email.message import EmailMessage, Message
 from email.utils import formatdate, getaddresses, make_msgid, parsedate_to_datetime
 from typing import Any, Optional
 
+import mimetypes
+import pathlib
 from dotenv import load_dotenv
+try:
+    import markdown as _markdown_lib
+    _MARKDOWN_AVAILABLE = True
+except ImportError:
+    _MARKDOWN_AVAILABLE = False
 from mcp.server.fastmcp import FastMCP
 
 load_dotenv()
@@ -40,6 +47,7 @@ DEFAULT_SEARCH_LIMIT = int(os.getenv("EMAIL_SEARCH_LIMIT_DEFAULT", "20"))
 MAX_SEARCH_LIMIT = int(os.getenv("EMAIL_SEARCH_LIMIT_MAX", "100"))
 MAX_BODY_CHARS = int(os.getenv("MAX_BODY_CHARS", "20000"))
 MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", "5000000"))
+CONTACTS_FILE = os.getenv("EMAIL_CONTACTS_FILE", "contacts.json")
 
 
 mcp = FastMCP(
@@ -259,6 +267,13 @@ def _build_search_criteria(
     from_: Optional[str],
     to: Optional[str],
     subject: Optional[str],
+    cc: Optional[str] = None,
+    body: Optional[str] = None,
+    has_attachments: Optional[bool] = None,
+    unseen_only: Optional[bool] = None,
+    flagged_only: Optional[bool] = None,
+    larger_than_kb: Optional[int] = None,
+    smaller_than_kb: Optional[int] = None,
 ) -> list[str]:
     criteria: list[str] = ["ALL"]
     if since:
@@ -269,16 +284,68 @@ def _build_search_criteria(
         criteria.extend(["FROM", from_])
     if to:
         criteria.extend(["TO", to])
+    if cc:
+        criteria.extend(["CC", cc])
     if subject:
         criteria.extend(["SUBJECT", subject])
+    if body:
+        criteria.extend(["BODY", body])
     if query:
         criteria.extend(["TEXT", query])
+    if unseen_only:
+        criteria.append("UNSEEN")
+    if flagged_only:
+        criteria.append("FLAGGED")
+    if larger_than_kb is not None:
+        criteria.extend(["LARGER", str(larger_than_kb * 1024)])
+    if smaller_than_kb is not None:
+        criteria.extend(["SMALLER", str(smaller_than_kb * 1024)])
     return criteria
 
 
 def _safe_limit(limit: Optional[int]) -> int:
     requested = DEFAULT_SEARCH_LIMIT if limit is None else int(limit)
     return max(1, min(requested, MAX_SEARCH_LIMIT))
+
+
+def _markdown_to_html(text: str) -> str:
+    """Convert Markdown to HTML. Falls back to plain text wrapped in <pre> if library absent."""
+    if _MARKDOWN_AVAILABLE:
+        return _markdown_lib.markdown(text, extensions=["tables", "fenced_code", "nl2br"])
+    escaped = html.escape(text)
+    return f"<pre>{escaped}</pre>"
+
+
+def _markdown_to_plaintext(text: str) -> str:
+    """Strip basic Markdown syntax for plain-text fallback."""
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\*\*(.+?)\*\*", r"", text)
+    text = re.sub(r"\*(.+?)\*", r"", text)
+    text = re.sub(r"`(.+?)`", r"", text)
+    text = re.sub(r"\[(.+?)\]\(.+?\)", r"", text)
+    return text.strip()
+
+
+def _resolve_attachments(paths: list[str]) -> list[tuple[str, str, bytes]]:
+    """Read local files and return list of (filename, mimetype, data) tuples."""
+    resolved = []
+    for raw_path in paths:
+        path = pathlib.Path(raw_path.strip())
+        if not path.exists():
+            raise FileNotFoundError(f"Attachment not found: {path}")
+        if not path.is_file():
+            raise ValueError(f"Attachment path is not a file: {path}")
+        data = path.read_bytes()
+        if len(data) > MAX_ATTACHMENT_BYTES:
+            raise ValueError(
+                f"Attachment '{path.name}' is {len(data)} bytes, "
+                f"exceeds MAX_ATTACHMENT_BYTES ({MAX_ATTACHMENT_BYTES})."
+            )
+        mime_type, _ = mimetypes.guess_type(str(path))
+        if not mime_type:
+            mime_type = "application/octet-stream"
+        resolved.append((path.name, mime_type, data))
+    return resolved
 
 
 def _canonical_payload(
@@ -290,6 +357,7 @@ def _canonical_payload(
     body_text: str,
     body_html: str,
     reply_to_uid: Optional[str],
+    attachment_paths: Optional[list[str]] = None,
 ) -> str:
     payload = {
         "account_id": account_id,
@@ -300,6 +368,7 @@ def _canonical_payload(
         "body_text": body_text or "",
         "body_html": body_html or "",
         "reply_to_uid": reply_to_uid or "",
+        "attachment_paths": sorted(attachment_paths or []),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -324,6 +393,7 @@ def _build_outbound_message(
     subject: str,
     body_text: str,
     body_html: str,
+    attachment_paths: Optional[list[str]] = None,
 ) -> EmailMessage:
     message = EmailMessage()
     message["From"] = account.from_address
@@ -340,6 +410,9 @@ def _build_outbound_message(
         message.set_content(body_text or "")
     if bcc:
         message["Bcc"] = ", ".join(bcc)
+    for filename, mime_type, data in _resolve_attachments(attachment_paths or []):
+        maintype, subtype = mime_type.split("/", 1)
+        message.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
     return message
 
 
@@ -629,14 +702,36 @@ def search_emails(
     before: Optional[str] = None,
     from_: Optional[str] = None,
     to: Optional[str] = None,
+    cc: Optional[str] = None,
     subject: Optional[str] = None,
+    body: Optional[str] = None,
+    unseen_only: Optional[bool] = None,
+    flagged_only: Optional[bool] = None,
+    larger_than_kb: Optional[int] = None,
+    smaller_than_kb: Optional[int] = None,
     limit: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Search IMAP messages and return recent metadata without message bodies."""
+    """Search IMAP messages and return recent metadata without message bodies.
+
+    Advanced filters:
+    - cc: filter by CC recipient
+    - body: full-text search in message body (server-side IMAP BODY search)
+    - unseen_only: return only unread messages
+    - flagged_only: return only flagged/starred messages
+    - larger_than_kb / smaller_than_kb: filter by message size in kilobytes
+    """
     account = _load_account(account_id)
     client = _connect_imap(account)
     try:
-        criteria = _build_search_criteria(query, since, before, from_, to, subject)
+        criteria = _build_search_criteria(
+            query, since, before, from_, to, subject,
+            cc=cc, body=body,
+            has_attachments=None,
+            unseen_only=unseen_only,
+            flagged_only=flagged_only,
+            larger_than_kb=larger_than_kb,
+            smaller_than_kb=smaller_than_kb,
+        )
         safe_limit = _safe_limit(limit)
         uids = _search_uids(client, mailbox, criteria, readonly=True, limit=safe_limit)
         results = []
@@ -655,7 +750,7 @@ def search_emails(
                     "attachments": metadata["attachments"],
                 }
             )
-        return {"account_id": account_id, "mailbox": mailbox, "limit": safe_limit, "messages": results}
+        return {"account_id": account_id, "mailbox": mailbox, "limit": safe_limit, "total_found": len(results), "messages": results}
     finally:
         client.logout()
 
@@ -714,9 +809,15 @@ def prepare_email(
     subject: str = "",
     body_text: str = "",
     body_html: str = "",
+    body_markdown: str = "",
     reply_to_uid: Optional[str] = None,
+    attachment_paths: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-    """Prepare an outbound email and return a confirmation token. This does not send."""
+    """Prepare an outbound email and return a confirmation token. This does not send.
+
+    Supply body_markdown to have the server compile it to HTML + plain-text automatically.
+    Supply attachment_paths as a list of absolute local file paths to attach files.
+    """
     account = _load_account(account_id)
     if not account.can_send:
         raise ValueError(f"Account '{account_id}' is not configured for SMTP sending.")
@@ -725,6 +826,10 @@ def prepare_email(
     recipients_bcc = _as_list(bcc)
     if not recipients_to and not recipients_cc and not recipients_bcc:
         raise ValueError("At least one recipient is required.")
+    if body_markdown:
+        body_html = body_html or _markdown_to_html(body_markdown)
+        body_text = body_text or _markdown_to_plaintext(body_markdown)
+    _resolve_attachments(attachment_paths or [])  # validate paths early
     canonical = _canonical_payload(
         account_id,
         recipients_to,
@@ -734,6 +839,7 @@ def prepare_email(
         body_text,
         body_html,
         reply_to_uid,
+        attachment_paths,
     )
     token = _send_token(canonical)
     return {
@@ -745,6 +851,7 @@ def prepare_email(
         "subject": subject,
         "body_text_preview": (body_text or "")[:1000],
         "body_html_preview": _sanitize_html(body_html or "")[:1000],
+        "attachment_paths": attachment_paths or [],
         "reply_to_uid": reply_to_uid,
         "send_token": token,
         "send_requires_same_payload": True,
@@ -761,15 +868,23 @@ def send_prepared_email(
     subject: str = "",
     body_text: str = "",
     body_html: str = "",
+    body_markdown: str = "",
     reply_to_uid: Optional[str] = None,
+    attachment_paths: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-    """Send an email only if the content matches a valid prepare_email token."""
+    """Send an email only if the content matches a valid prepare_email token.
+
+    Pass the same body_markdown and attachment_paths used in prepare_email.
+    """
     account = _load_account(account_id)
     if not account.can_send:
         raise ValueError(f"Account '{account_id}' is not configured for SMTP sending.")
     recipients_to = _as_list(to)
     recipients_cc = _as_list(cc)
     recipients_bcc = _as_list(bcc)
+    if body_markdown:
+        body_html = body_html or _markdown_to_html(body_markdown)
+        body_text = body_text or _markdown_to_plaintext(body_markdown)
     canonical = _canonical_payload(
         account_id,
         recipients_to,
@@ -779,6 +894,7 @@ def send_prepared_email(
         body_text,
         body_html,
         reply_to_uid,
+        attachment_paths,
     )
     expected_token = _send_token(canonical)
     if not send_token or not hmac.compare_digest(send_token, expected_token):
@@ -792,13 +908,14 @@ def send_prepared_email(
         subject,
         body_text,
         body_html,
+        attachment_paths,
     )
     recipients = recipients_to + recipients_cc + recipients_bcc
     client = _connect_smtp(account)
     try:
         client.send_message(message, from_addr=account.from_address, to_addrs=recipients)
-        logger.info("Sent email account=%s recipients=%d", account_id, len(recipients))
-        return {"success": True, "account_id": account_id, "from": account.from_address, "recipients": recipients}
+        logger.info("Sent email account=%s recipients=%d attachments=%d", account_id, len(recipients), len(attachment_paths or []))
+        return {"success": True, "account_id": account_id, "from": account.from_address, "recipients": recipients, "attachments_sent": len(attachment_paths or [])}
     finally:
         client.quit()
 
@@ -949,13 +1066,21 @@ def email_save_draft(
     subject: str = "",
     body_text: str = "",
     body_html: str = "",
+    body_markdown: str = "",
     mailbox: str = "Drafts",
+    attachment_paths: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-    """Save a message as draft in the target IMAP mailbox."""
+    """Save a message as draft in the target IMAP mailbox.
+
+    Supports body_markdown (auto-compiled to HTML + plain-text) and attachment_paths.
+    """
     account = _load_account(account_id)
     recipients_to = _as_list(to)
     recipients_cc = _as_list(cc)
     recipients_bcc = _as_list(bcc)
+    if body_markdown:
+        body_html = body_html or _markdown_to_html(body_markdown)
+        body_text = body_text or _markdown_to_plaintext(body_markdown)
 
     message = _build_outbound_message(
         account,
@@ -965,6 +1090,7 @@ def email_save_draft(
         subject,
         body_text,
         body_html,
+        attachment_paths,
     )
     client = _connect_imap(account)
     try:
@@ -1452,6 +1578,195 @@ def email_find_unsubscribe_links(account_id: str, mailbox: str, uid: str) -> dic
             "uid": uid,
             "list_unsubscribe": header_links,
             "body_unsubscribe_links": sorted(set(body_links)),
+        }
+    finally:
+        client.logout()
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONTACTS / ADDRESS BOOK
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_contacts() -> list[dict[str, Any]]:
+    """Load contacts from CONTACTS_FILE. Returns [] if the file does not exist."""
+    path = pathlib.Path(CONTACTS_FILE)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else data.get("contacts", [])
+    except Exception as exc:
+        logger.warning("Could not load contacts file %s: %s", CONTACTS_FILE, exc)
+        return []
+
+
+def _save_contacts(contacts: list[dict[str, Any]]) -> None:
+    path = pathlib.Path(CONTACTS_FILE)
+    path.write_text(json.dumps(contacts, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+@mcp.tool()
+def contacts_lookup(
+    name: Optional[str] = None,
+    email_fragment: Optional[str] = None,
+) -> dict[str, Any]:
+    """Look up contacts by name or e-mail fragment.
+
+    Returns matching entries from the local contacts.json file.
+    Use this to resolve "escríbele a Antonio" -> actual email address.
+    """
+    contacts = _load_contacts()
+    if not name and not email_fragment:
+        return {"contacts": contacts, "total": len(contacts)}
+    results = []
+    name_lower = (name or "").lower()
+    email_lower = (email_fragment or "").lower()
+    for contact in contacts:
+        contact_name = (contact.get("name") or "").lower()
+        contact_email = (contact.get("email") or "").lower()
+        contact_aliases = [a.lower() for a in (contact.get("aliases") or [])]
+        name_match = name_lower and (name_lower in contact_name or any(name_lower in a for a in contact_aliases))
+        email_match = email_lower and email_lower in contact_email
+        if name_match or email_match:
+            results.append(contact)
+    return {"contacts": results, "total": len(results)}
+
+
+@mcp.tool()
+def contacts_upsert(
+    name: str,
+    email: str,
+    aliases: Optional[list[str]] = None,
+    notes: Optional[str] = None,
+) -> dict[str, Any]:
+    """Add or update a contact in the local contacts.json file.
+
+    If a contact with the same email already exists it is updated, otherwise created.
+    """
+    contacts = _load_contacts()
+    email = email.strip().lower()
+    for contact in contacts:
+        if (contact.get("email") or "").lower() == email:
+            contact["name"] = name
+            if aliases is not None:
+                contact["aliases"] = aliases
+            if notes is not None:
+                contact["notes"] = notes
+            _save_contacts(contacts)
+            return {"action": "updated", "contact": contact}
+    new_contact: dict[str, Any] = {"name": name, "email": email}
+    if aliases:
+        new_contact["aliases"] = aliases
+    if notes:
+        new_contact["notes"] = notes
+    contacts.append(new_contact)
+    _save_contacts(contacts)
+    return {"action": "created", "contact": new_contact}
+
+
+@mcp.tool()
+def contacts_delete(email: str) -> dict[str, Any]:
+    """Remove a contact from the local contacts.json file by exact email address."""
+    contacts = _load_contacts()
+    email = email.strip().lower()
+    before = len(contacts)
+    contacts = [c for c in contacts if (c.get("email") or "").lower() != email]
+    _save_contacts(contacts)
+    removed = before - len(contacts)
+    return {"removed": removed, "email": email}
+
+
+@mcp.tool()
+def contacts_import_from_sent(
+    account_id: str,
+    mailbox: str = "Sent",
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Scan Sent folder to auto-populate the contacts file from To/CC headers.
+
+    Existing contacts are not overwritten; only new addresses are added.
+    """
+    account = _load_account(account_id)
+    client = _connect_imap(account)
+    try:
+        uids = _search_uids(client, mailbox, ["ALL"], readonly=True, limit=limit)
+        contacts = _load_contacts()
+        existing_emails = {(c.get("email") or "").lower() for c in contacts}
+        added = 0
+        for uid in uids:
+            message = _fetch_message(client, uid)
+            for header in ("To", "CC", "Bcc"):
+                raw = message.get(header, "")
+                for display_name, addr in getaddresses([raw]):
+                    addr = addr.strip().lower()
+                    if not addr or addr in existing_emails:
+                        continue
+                    new_contact: dict[str, Any] = {"name": _decode(display_name) or addr, "email": addr}
+                    contacts.append(new_contact)
+                    existing_emails.add(addr)
+                    added += 1
+        _save_contacts(contacts)
+        return {"account_id": account_id, "mailbox": mailbox, "added": added, "total_contacts": len(contacts)}
+    finally:
+        client.logout()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXTRACT ATTACHMENTS (single-call download to local directory)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def email_extract_attachments(
+    account_id: str,
+    mailbox: str,
+    uid: str,
+    destination_dir: str,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Download ALL attachments from a message to a local directory in one call.
+
+    Returns a list of saved file paths so the agent can work with them directly.
+    Eliminates the need to call get_email + get_attachment for each part separately.
+    """
+    account = _load_account(account_id)
+    dest = pathlib.Path(destination_dir)
+    if not dest.exists():
+        dest.mkdir(parents=True, exist_ok=True)
+    if not dest.is_dir():
+        raise ValueError(f"destination_dir '{destination_dir}' is not a directory.")
+    client = _connect_imap(account)
+    try:
+        _select_mailbox(client, mailbox, readonly=True)
+        message = _fetch_message(client, uid)
+        saved = []
+        skipped = []
+        parts = list(message.walk()) if message.is_multipart() else [message]
+        for part in parts:
+            disposition = part.get_content_disposition() or ""
+            filename = _decode(part.get_filename())
+            if not filename or disposition not in ("attachment", "inline"):
+                continue
+            payload = part.get_payload(decode=True) or b""
+            if len(payload) > MAX_ATTACHMENT_BYTES:
+                skipped.append({"filename": filename, "reason": "exceeds MAX_ATTACHMENT_BYTES", "size": len(payload)})
+                continue
+            # sanitize filename to prevent path traversal
+            safe_name = pathlib.Path(filename).name
+            target = dest / safe_name
+            if target.exists() and not overwrite:
+                skipped.append({"filename": safe_name, "reason": "already exists", "path": str(target)})
+                continue
+            target.write_bytes(payload)
+            saved.append({"filename": safe_name, "path": str(target), "size": len(payload), "content_type": part.get_content_type()})
+        logger.info("Extracted attachments account=%s mailbox=%s uid=%s saved=%d", account_id, mailbox, uid, len(saved))
+        return {
+            "account_id": account_id,
+            "mailbox": mailbox,
+            "uid": uid,
+            "destination_dir": str(dest),
+            "saved": saved,
+            "skipped": skipped,
         }
     finally:
         client.logout()
