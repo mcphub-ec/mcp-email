@@ -1,18 +1,54 @@
 .venv/
 venv/
 env/
+ENV/
 
+# Variables de entorno — NUNCA commitear
 .env
 .env.local
 .env.*.local
 
+# Certificados digitales — NUNCA commitear
+certs/
+*.p12
+*.pfx
+*.pem
+*.key
+*.crt
+*.cer
+*.jks
+
+# Caché de Python
 __pycache__/
 *.pyc
-.pytest_cache/
+*.pyo
+*.pyd
 
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
 *.log
 server.log
 nohup.out
+logs/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
 
 # PII: contacts.json contains personally identifiable information (names, emails, notes)
 # Keep it local-only — never commit.
@@ -22,6 +58,7 @@ contacts*.json
 # Beads / Dolt (local-only, no commitear)
 .beads/
 .dolt/
+*.db
 
 # Beads / Dolt (local-only, no commitear)
 .beads/
