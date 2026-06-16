@@ -14,6 +14,15 @@ __pycache__/
 server.log
 nohup.out
 
+# PII: contacts.json contains personally identifiable information (names, emails, notes)
+# Keep it local-only — never commit.
+contacts.json
+contacts*.json
+
+# Beads / Dolt (local-only, no commitear)
+.beads/
+.dolt/
+
 # Beads / Dolt (local-only, no commitear)
 .beads/
 .dolt/

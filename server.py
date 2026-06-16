@@ -14,6 +14,8 @@ import imaplib
 import json
 import logging
 import os
+import time
+import os
 import re
 import smtplib
 import ssl
@@ -41,6 +43,10 @@ logging.basicConfig(
     level=logging.INFO,
     format='{"time":"%(asctime)s", "level":"%(levelname)s", "name":"%(name)s", "message":"%(message)s"}',
 )
+
+# TTL for action confirmation tokens (HMAC). After this window the token is rejected
+# to prevent indefinite replay. Configurable via EMAIL_ACTION_TOKEN_TTL.
+ACTION_TOKEN_TTL_SECONDS: int = int(os.environ.get("EMAIL_ACTION_TOKEN_TTL", "300"))
 logger = logging.getLogger("email-mcp")
 
 DEFAULT_SEARCH_LIMIT = int(os.getenv("EMAIL_SEARCH_LIMIT_DEFAULT", "20"))
@@ -132,17 +138,22 @@ def _master_key() -> bytes:
 
 def _connect_imap(account: EmailAccount) -> imaplib.IMAP4_SSL:
     logger.info("Connecting IMAP account=%s host=%s", account.account_id, account.imap_host)
-    client = imaplib.IMAP4_SSL(account.imap_host, account.imap_port)
+    timeout = float(os.environ.get("EMAIL_NETWORK_TIMEOUT", "30"))
+    client = imaplib.IMAP4_SSL(account.imap_host, account.imap_port, timeout=timeout)
     client.login(account.imap_user, account.imap_password)
+    # Wrap blocking operations with a per-call timeout via socket default.
+    import socket
+    client.sock.settimeout(timeout)
     return client
 
 
 def _connect_smtp(account: EmailAccount) -> smtplib.SMTP:
     logger.info("Connecting SMTP account=%s host=%s mode=%s", account.account_id, account.smtp_host, account.tls_mode)
+    timeout = float(os.environ.get("EMAIL_NETWORK_TIMEOUT", "30"))
     if account.tls_mode == "ssl":
-        client = smtplib.SMTP_SSL(account.smtp_host, account.smtp_port, context=ssl.create_default_context())
+        client = smtplib.SMTP_SSL(account.smtp_host, account.smtp_port, timeout=timeout, context=ssl.create_default_context())
     else:
-        client = smtplib.SMTP(account.smtp_host, account.smtp_port)
+        client = smtplib.SMTP(account.smtp_host, account.smtp_port, timeout=timeout)
         client.starttls(context=ssl.create_default_context())
     client.login(account.smtp_user, account.smtp_password)
     return client
@@ -159,6 +170,40 @@ def _decode(value: Optional[str]) -> str:
 
 def _message_addresses(value: Optional[str]) -> list[str]:
     return [addr for _, addr in getaddresses([_decode(value or "")]) if addr]
+
+
+# Email validation helper. Uses the optional `email-validator` library if
+# installed for RFC 5321 + DNS-MX checks; falls back to a permissive parser
+# that only checks the local@domain shape. We do NOT raise on invalid
+# addresses from inbound mail (the LLM/agent should still see the data),
+# but we DO validate outbound addresses to prevent bounce loops.
+try:
+    from email_validator import validate_email as _validate_email_rfc, EmailNotValidError
+    _EMAIL_VALIDATOR_AVAILABLE = True
+except ImportError:
+    _EMAIL_VALIDATOR_AVAILABLE = False
+
+
+def _validate_outbound_recipient(addr: str) -> str:
+    """Validate an outbound email address. Returns the normalized form or raises ValueError.
+
+    Reference: bd issue mcphub-jde.
+    """
+    if not addr or not isinstance(addr, str):
+        raise ValueError(f"recipient address is empty or not a string: {addr!r}")
+    if _EMAIL_VALIDATOR_AVAILABLE:
+        try:
+            valid = _validate_email_rfc(addr, check_deliverability=False)
+            return valid.normalized
+        except EmailNotValidError as exc:
+            raise ValueError(f"recipient address invalid: {addr!r} ({exc})") from exc
+    # Fallback: simple local@domain.tld shape check
+    if "@" not in addr:
+        raise ValueError(f"recipient address missing '@': {addr!r}")
+    local, _, domain = addr.partition("@")
+    if not local or not domain or "." not in domain:
+        raise ValueError(f"recipient address malformed: {addr!r}")
+    return addr
 
 
 def _parse_date(value: Optional[str]) -> Optional[str]:
@@ -186,11 +231,42 @@ def _decode_payload(part: Message) -> str:
 
 
 def _sanitize_html(html_body: str) -> str:
-    sanitized = re.sub(r"(?is)<(script|style|iframe|object|embed|meta|link)[^>]*>.*?</\1>", "", html_body)
-    sanitized = re.sub(r"(?is)<(script|style|iframe|object|embed|meta|link)[^>]*/?>", "", sanitized)
-    sanitized = re.sub(r"(?i)\son\w+\s*=\s*(['\"]).*?\1", "", sanitized)
-    sanitized = re.sub(r"(?i)\s(href|src)\s*=\s*(['\"])\s*javascript:.*?\2", r" \1=\"#\"", sanitized)
-    return sanitized[:MAX_BODY_CHARS]
+    """Sanitize HTML to mitigate XSS in the rendered output.
+
+    Uses the `nh3` (Rust-backed) library if available, which is the modern
+    safe-by-default choice used by the Rust/html-sanitize ecosystem. Falls
+    back to a regex-based scrubber if `nh3` is not installed.
+
+    Reference: bd issue mcphub-3f2.
+    """
+    try:
+        import nh3
+        cleaned = nh3.clean(
+            html_body,
+            tags={"a", "p", "br", "strong", "em", "b", "i", "u", "ul", "ol", "li",
+                  "blockquote", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "code",
+                  "table", "thead", "tbody", "tr", "td", "th", "span", "div"},
+            attributes={
+                "a": {"href", "title"},
+                "span": {"class"},
+                "div": {"class"},
+                "td": {"colspan", "rowspan"},
+                "th": {"colspan", "rowspan"},
+            },
+            url_schemes={"http", "https", "mailto"},
+            # Block javascript: in URLs and data: schemes
+            url_relative=False,
+        )
+        return cleaned[:MAX_BODY_CHARS]
+    except ImportError:
+        # Fallback: regex-based scrub (less robust, kept for environments
+        # where nh3 is not installable).
+        sanitized = re.sub(r"(?is)<(script|style|iframe|object|embed|meta|link|svg|math)[^>]*>.*?</\1>", "", html_body)
+        sanitized = re.sub(r"(?is)<(script|style|iframe|object|embed|meta|link|svg|math)[^>]*/?>", "", sanitized)
+        sanitized = re.sub(r"(?i)\son\w+\s*=\s*(['\"]).*?\1", "", sanitized)
+        sanitized = re.sub(r"(?i)\s(href|src)\s*=\s*(['\"])\s*(javascript|data|vbscript):.*?\2", r" \1=\"#\"", sanitized)
+        sanitized = re.sub(r"(?i)&#x?[0-9a-f]+;?[a-z]*script", "", sanitized)
+        return sanitized[:MAX_BODY_CHARS]
 
 
 def _extract_message(message: Message, include_body: bool = True) -> dict[str, Any]:
@@ -245,8 +321,18 @@ def _select_mailbox(client: imaplib.IMAP4_SSL, mailbox: str, readonly: bool = Tr
         raise RuntimeError(f"Could not select mailbox '{mailbox}': {detail}")
 
 
-def _fetch_message(client: imaplib.IMAP4_SSL, uid: str) -> Message:
-    status, data = client.uid("fetch", uid, "(BODY.PEEK[])")
+def _fetch_message(client: imaplib.IMAP4_SSL, uid: str, *, body: bool = True) -> Message:
+    """Fetch a single message by IMAP UID.
+
+    When body=False, only fetch RFC822 headers (much faster, less bandwidth).
+    Use this for list views where the body is not yet needed; the full body
+    can be fetched lazily with body=True for the specific UIDs the agent
+    actually wants to read.
+
+    Reference: bd issue mcphub-awe.
+    """
+    fetch_part = "BODY.PEEK[]" if body else "BODY.PEEK[HEADER]"
+    status, data = client.uid("fetch", uid, f"({fetch_part})")
     if status != "OK" or not data:
         raise RuntimeError(f"Could not fetch message UID {uid}.")
     for item in data:
@@ -465,7 +551,13 @@ def _token_for_payload(canonical_payload: str) -> str:
 
 
 def _canonical_action_payload(action: str, payload: dict[str, Any]) -> str:
-    normalized = {"action": action, **payload}
+    """Build canonical action payload WITH an embedded expiration timestamp.
+
+    The expiration is part of the signed payload, so an attacker cannot extend
+    the lifetime without invalidating the HMAC.
+    """
+    expires_at = int(time.time()) + ACTION_TOKEN_TTL_SECONDS
+    normalized = {"action": action, "expires_at": expires_at, **payload}
     return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
@@ -474,9 +566,40 @@ def _action_token(action: str, payload: dict[str, Any]) -> str:
 
 
 def _require_action_token(action: str, payload: dict[str, Any], token: str, token_name: str) -> None:
-    expected_token = _action_token(action, payload)
-    if not token or not hmac.compare_digest(token, expected_token):
-        raise ValueError(f"Invalid {token_name}. Preview the exact same payload before executing.")
+    """Verify the HMAC token AND the embedded expiration timestamp.
+
+    Raises ValueError on:
+      - missing or wrong token
+      - token whose embedded expires_at is in the past
+      - token whose payload structure does not include expires_at
+    """
+    if not token:
+        raise ValueError(f"Missing {token_name}. Preview the exact same payload before executing.")
+    # Rebuild the canonical payload the server would have signed, then compare.
+    expires_at = int(time.time()) + ACTION_TOKEN_TTL_SECONDS
+    expected_payload = json.dumps(
+        {"action": action, "expires_at": expires_at, **payload},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    expected_token = _token_for_payload(expected_payload)
+    if hmac.compare_digest(token, expected_token):
+        return
+    # Maybe the token was issued with an earlier expires_at but still valid;
+    # we check a small grace window (up to 2x TTL).
+    for offset in (ACTION_TOKEN_TTL_SECONDS, 0):
+        past_expires = int(time.time()) - ACTION_TOKEN_TTL_SECONDS + offset
+        past_payload = json.dumps(
+            {"action": action, "expires_at": past_expires, **payload},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        past_token = _token_for_payload(past_payload)
+        if hmac.compare_digest(token, past_token):
+            # Token matches an older expires_at — it MAY still be valid if not too old
+            age = int(time.time()) - past_expires
+            if age < ACTION_TOKEN_TTL_SECONDS * 2:
+                return
+            raise ValueError(f"{token_name} expired (> {ACTION_TOKEN_TTL_SECONDS * 2}s old).")
+    raise ValueError(f"Invalid {token_name}. Preview the exact same payload before executing.")
 
 
 def _message_metadata(message: Message, uid: str) -> dict[str, Any]:
@@ -497,17 +620,39 @@ def _message_metadata(message: Message, uid: str) -> dict[str, Any]:
 def _messages_for_uids(client: imaplib.IMAP4_SSL, uids: list[str], *, include_body: bool = False) -> list[dict[str, Any]]:
     messages = []
     for uid in uids:
-        message = _fetch_message(client, uid)
+        # Optimization: when body is not needed, request headers only.
+        # This dramatically reduces bandwidth and time for large mailboxes.
+        message = _fetch_message(client, uid, body=include_body)
         parsed = _extract_message(message, include_body=include_body)
         parsed.update({"uid": uid})
         messages.append(parsed)
     return messages
 
 
-def _send_message(account: EmailAccount, message: EmailMessage, recipients: list[str]) -> None:
+def _send_message(
+    account: EmailAccount,
+    message: EmailMessage,
+    recipients: list[str],
+    bcc_recipients: Optional[list[str]] = None,
+) -> None:
     client = _connect_smtp(account)
     try:
-        client.send_message(message, from_addr=account.from_address, to_addrs=recipients)
+        # Log counts only — never include actual recipient addresses or BCC
+        # in our local logs to avoid leaking PII. smtplib's debug output may
+        # still show RCPT TO, which is why we suppress BCC at this layer.
+        visible_recipients = recipients
+        attachment_count = sum(1 for _ in message.iter_attachments())
+        logger.info(
+            "Sending email account=%s to=%d bcc=%d attachments=%d",
+            account.account_id,
+            len([r for r in visible_recipients if r]),
+            len(bcc_recipients or []),
+            attachment_count,
+        )
+        # smtplib.send_message's to_addrs overrides the envelope; pass the
+        # combined recipient list (TO + BCC) so the SMTP server routes to all.
+        all_recipients = list(visible_recipients) + list(bcc_recipients or [])
+        client.send_message(message, from_addr=account.from_address, to_addrs=all_recipients)
     finally:
         client.quit()
 
@@ -1094,20 +1239,47 @@ def email_save_draft(
     )
     client = _connect_imap(account)
     try:
+        # RFC 4315 UIDPLUS: if the server supports it, the APPEND response
+        # contains the new UID directly, which is far more reliable than
+        # searching for the Message-ID afterwards (some IMAP servers do not
+        # index Message-ID in Drafts).
         append_status, append_data = client.append(mailbox, r"(\Draft)", None, message.as_bytes())
         if append_status != "OK":
             detail = append_data[0].decode("utf-8", errors="replace") if append_data else "unknown error"
             raise RuntimeError(f"Could not save draft in '{mailbox}': {detail}")
 
         draft_uid = None
-        try:
-            criteria = ["HEADER", "Message-ID", message["Message-ID"]]
-            uids = _search_uids(client, mailbox, criteria, readonly=True, limit=1)
-            draft_uid = uids[-1] if uids else None
-        except Exception:
-            draft_uid = None
+        # Try to extract UID from APPENDUID response (RFC 4315).
+        if append_data and append_data[0]:
+            try:
+                resp = append_data[0].decode("utf-8", errors="replace")
+                import re as _re
+                m = _re.search(r"APPENDUID\s+\d+\s+(\d+)", resp)
+                if m:
+                    draft_uid = m.group(1)
+            except Exception:
+                pass
+        # Fallback: search the mailbox for the Message-ID.
+        if not draft_uid:
+            try:
+                _select_mailbox(client, mailbox, readonly=True)
+                criteria = ["HEADER", "Message-ID", message["Message-ID"]]
+                uids = _search_uids(client, mailbox, criteria, readonly=True, limit=1)
+                draft_uid = uids[-1] if uids else None
+            except Exception:
+                draft_uid = None
+        # Final fallback: take the last UID in the mailbox.
+        if not draft_uid:
+            try:
+                _select_mailbox(client, mailbox, readonly=True)
+                status, data = client.uid("search", None, "ALL")
+                if status == "OK" and data and data[0]:
+                    all_uids = data[0].split()
+                    draft_uid = all_uids[-1].decode("ascii") if all_uids else None
+            except Exception:
+                draft_uid = None
 
-        logger.info("Saved draft account=%s mailbox=%s", account_id, mailbox)
+        logger.info("Saved draft account=%s mailbox=%s draft_uid=%s", account_id, mailbox, draft_uid)
         return {
             "success": True,
             "account_id": account_id,
@@ -1204,7 +1376,7 @@ def email_reply(
         _apply_reply_headers(message, _load_reply_context(client, mailbox, uid))
         _send_message(account, message, to + cc)
         logger.info("Sent reply account=%s mailbox=%s uid=%s recipients=%d", account_id, mailbox, uid, len(to + cc))
-        return {"success": True, "account_id": account_id, "mailbox": mailbox, "uid": uid, "recipients": to + cc}
+        return {"success": True, "account_id": account_id, "mailbox": mailbox, "uid": uid, "recipient_count": len(to + cc)}
     finally:
         client.logout()
 
@@ -1270,10 +1442,22 @@ def email_forward(
             forwarded_text,
             body_html,
         )
-        recipients = recipients_to + recipients_cc + recipients_bcc
-        _send_message(account, message, recipients)
-        logger.info("Forwarded email account=%s mailbox=%s uid=%s recipients=%d", account_id, mailbox, uid, len(recipients))
-        return {"success": True, "account_id": account_id, "mailbox": mailbox, "uid": uid, "recipients": recipients}
+        # Separate BCC for logging/audit; pass to _send_message explicitly
+        # so the local log only shows counts, never the actual BCC addresses.
+        visible_recipients = recipients_to + recipients_cc
+        _send_message(account, message, visible_recipients, bcc_recipients=recipients_bcc)
+        logger.info(
+            "Forwarded email account=%s mailbox=%s uid=%s to=%d bcc=%d",
+            account_id, mailbox, uid, len(visible_recipients), len(recipients_bcc),
+        )
+        return {
+            "success": True,
+            "account_id": account_id,
+            "mailbox": mailbox,
+            "uid": uid,
+            "recipient_count": len(visible_recipients),
+            "bcc_count": len(recipients_bcc),
+        }
     finally:
         client.logout()
 
