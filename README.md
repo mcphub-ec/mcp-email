@@ -48,6 +48,32 @@ Servidor Model Context Protocol (MCP) para que agentes IA consulten correos por 
 - `contacts_lookup`: **nuevo** — busca contactos por nombre o fragmento de email en el archivo `contacts.json` local.
 - `contacts_upsert`: **nuevo** — agrega o actualiza un contacto (nombre, email, alias, notas).
 - `contacts_delete`: **nuevo** — elimina un contacto por email exacto.
+- `contacts_import_from_sent`: **nuevo** — importa contactos desde la carpeta Sent de una cuenta.
+
+### Seguridad y Resiliencia (auditoría 2026-06-16)
+- **Tokens de acción con expiración** (`EMAIL_ACTION_TOKEN_TTL`, default 300s): las acciones destructivas
+  (`delete_messages`, `archive_messages`, `apply_rules`, `email_reply`, `email_forward`, `email_delete_messages`)
+  requieren un token HMAC que caduca automáticamente. Evita replay indefinido.
+- **Validación de emails con `email-validator`**: las direcciones de destino se validan contra RFC 5321.
+  Si la librería no está disponible, fallback a validación de shape `local@domain.tld`.
+- **Sanitización HTML con `nh3` (Rust-backed)**: limpia HTML de correos entrantes. Fallback regex si
+  `nh3` no está instalado. Bloquea XSS vía `<script>`, `data:`, `javascript:`, `&colon;` bypass, etc.
+- **Timeouts IMAP/SMTP** configurables vía `EMAIL_NETWORK_TIMEOUT` (default 30s).
+- **Optimización `search_emails`**: hace fetch de headers (no body) por defecto para list views.
+- **`email_save_draft` robusto**: usa RFC 4315 APPENDUID, fallback a búsqueda por Message-ID, fallback
+  al último UID del mailbox.
+- **BCC separado de los logs**: el campo `bcc_count` aparece en respuestas, no las direcciones reales.
+
+### Dependencias (post-auditoría)
+```
+fastmcp==3.3.1
+mcp==1.27.1
+python-dotenv==1.2.2
+uvicorn==0.48.0
+Markdown==3.7
+email-validator==2.2.0    # validación RFC 5321
+nh3==0.2.20               # sanitización HTML
+```
 - `contacts_import_from_sent`: **nuevo** — escanea la carpeta Sent y auto-popula `contacts.json` con nuevas direcciones encontradas.
 
 ### Diagnostico
