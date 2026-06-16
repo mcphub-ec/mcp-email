@@ -13,3 +13,7 @@ __pycache__/
 *.log
 server.log
 nohup.out
+
+# Beads / Dolt (local-only, no commitear)
+.beads/
+.dolt/
