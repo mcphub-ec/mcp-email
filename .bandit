@@ -1,2 +1,6 @@
 [bandit]
-skips = B101,B104,B108,B603,B607
+skips = B101,B108,B603,B607
+# B104 (bind 0.0.0.0) was previously skipped. Now host is read from
+# MCP_HOST env var (default 0.0.0.0 in Docker; 127.0.0.1 for local dev).
+# The lint check would catch hardcoded 0.0.0.0 if reintroduced.
+# (bd issue mcphub-wqy)
